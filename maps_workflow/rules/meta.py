@@ -2,7 +2,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel
 from maps_workflow.baserule import BaseRule
-from maps_workflow.exceptions import RuleViolation
+from maps_workflow.exceptions import RuleViolationError
 
 
 class ValidParams(BaseModel):
@@ -12,30 +12,44 @@ class ValidParams(BaseModel):
     values: Optional[List[str]] = []
 
 
+def _handle_noop(_: str):
+    return RuleViolationError(message="Type not implemented!", errors=[])
+
+
 class Valid(BaseRule):
     params: ValidParams
 
     def get_params_model(self):
         return ValidParams
 
-    def __handle_noop(self, value: str):
-        return RuleViolation(message=f"Type not implemented!", errors=[])
-
     def __handle_regex(self, value: str):
         import re
+
         try:
             regex: re.Pattern = re.compile(self.params.regex)
             if regex.match(value):
                 return True
-            return RuleViolation(message=f"\"{value}\" does not match \"{self.params.regex}\".", errors=[value, "!=", self.params.regex])
+            return RuleViolationError(
+                message=f'"{value}" does not match "{self.params.regex}".',
+                errors=[value, "!=", self.params.regex],
+            )
         except Exception:
-            return RuleViolation(message=f"\"{value}\" does not match \"{self.params.regex}\".", errors=[value, "!=", self.params.regex])
+            return RuleViolationError(
+                message=f'"{value}" does not match "{self.params.regex}".',
+                errors=[value, "!=", self.params.regex],
+            )
 
-    def __handle_list(self, value: str):
+    def __handle_list(self, value: str) -> RuleViolationError | None:
         values = value.split(",")
         for val in values:
             if val not in self.params.values:
-                return RuleViolation(message=f"\"{val}\" in \"{self.params.field}\" is not explicitly set. Allowed values: \"{', '.join(self.params.values)}\".", errors=[val, "in", self.params.values])
+                return RuleViolationError(
+                    message=f'"{val}" in "{self.params.field}" is not explicitly set. "'
+                    f'Allowed values: "{", ".join(self.params.values)}".',
+                    errors=[val, "in", self.params.values],
+                )
+            return None
+        return None
 
     def evaluate(self):
         violations = []
@@ -45,13 +59,13 @@ class Valid(BaseRule):
                 "list": self.__handle_list,
                 "regex": self.__handle_regex,
             }
-            
-            violations.append(value_type.get(self.params.type, self.__handle_noop)(value))
+
+            violations.append(value_type.get(self.params.type, _handle_noop)(value))
         return violations
 
     def explain(self):
         if hasattr(self.map_file.info.settings, self.params.field):
             value = getattr(self.map_file.info.settings, self.params.field)
-            return f"Setting \'{value}\' in \'{self.params.field}\' is not a valid option"
+            return f"Setting '{value}' in '{self.params.field}' is not a valid option"
         else:
-            return f"Setting \'{self.params.field}\' is not set"
+            return f"Setting '{self.params.field}' is not set"

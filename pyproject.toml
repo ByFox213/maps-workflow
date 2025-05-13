@@ -7,7 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.1.3",
     "pydantic>=2.10.1",
-    "ruamel-yaml>=0.18.6",
+    "ruamel.yaml>=0.18.6",
     "twmap>=0.6.2",
 ]
 

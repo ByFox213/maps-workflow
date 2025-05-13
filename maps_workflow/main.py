@@ -1,7 +1,6 @@
 import importlib
 import os
 from pathlib import Path
-import sys
 import time
 import traceback
 import logging
@@ -9,16 +8,23 @@ from pydantic import ValidationError
 import twmap
 import argparse
 from ruamel.yaml import YAML
-import csv
 import types
 
-from maps_workflow.baserule import BaseRule, BaseRuleConfig, RuleStatus, Status
+from baserule import BaseRule, BaseRuleConfig, RuleStatus, Status
+
+STATUS_SYMBOL = {
+    Status.COMPLETED: "✅",
+    Status.FAILED: "❌",
+    Status.WARN: "⚠️",
+    Status.SKIP: "⏭️",
+}
 
 
-def load_rules_from_file(file_path):
-    with open(file_path, 'r') as file:
+def load_rules_from_file(_file_path: str):
+    with open(_file_path, "r") as file:
         yaml = YAML()
         return yaml.load(file)
+
 
 def load_rule_from_module(rule_name) -> types.ModuleType | None:
     try:
@@ -28,19 +34,61 @@ def load_rule_from_module(rule_name) -> types.ModuleType | None:
         logging.warning(f"⚠️ Module 'maps_workflow.{rule_name}' not found.")
         return None
 
-def load_all_rules(directory='rules/', exclude=[]):
-    all_rules = {'rules': []}
+
+def load_all_rules(directory="rules/", exclude=None):
+    if exclude is None:
+        exclude = []
+
+    all_rules = {"rules": []}
     for filename in sorted(os.listdir(directory)):
         if any(filename.startswith(skip) for skip in exclude):
             continue
 
-        if filename.endswith('.yaml'):
-            file_path = os.path.join(directory, filename)
-            rules = load_rules_from_file(file_path)
-            all_rules['rules'].extend(rules['rules'])
+        if filename.endswith(".yaml"):
+            _file_path = os.path.join(directory, filename)
+            rules = load_rules_from_file(_file_path)
+            all_rules["rules"].extend(rules["rules"])
     return all_rules
 
-def execute_rules(raw_file, map_data, config) -> tuple[bool, str]:
+
+def __handle_rule_error(
+    rule,
+    current_rule_status,
+    require_log_message: str,
+    fail_log_message: str,
+    skip_log_message: str,
+):
+    if rule.type == "require":
+        current_rule_status.status = Status.FAILED
+        logging.error(require_log_message)
+        result_string = (
+            f"\n#### {STATUS_SYMBOL.get(rule.status, '❌')} {rule.rule.name}\n"
+            f"**Explanation**: {rule.explain if rule.status != Status.COMPLETED else '-'}\n"
+            f"**Violations**: {'\n' if len(rule.violations) > 0 else '\n- No violations detected'}\n"
+            f"{'\n'.join([f'- {r}' for r in rule.violations])}"
+        )
+        return False, result_string
+    if rule.type == "fail":
+        current_rule_status.status = Status.WARN
+        logging.error(fail_log_message)
+        return None
+    if rule.type == "skip":
+        current_rule_status.status = Status.SKIP
+        logging.error(skip_log_message)
+        return None
+    return None
+
+
+def __format_rule_summary(rule):
+    return (
+        f"\n#### {STATUS_SYMBOL.get(rule.status, '❌')} {rule.rule.name}\n"
+        f"**Explanation**: {rule.explain if rule.status != Status.COMPLETED else '-'}\n"
+        f"**Violations**: {'\n' if rule.violations else '\n- No violations detected'}\n"
+        f"{'\n'.join([f'- {r}' for r in rule.violations])}"
+    )
+
+
+def execute_rules(raw_file, map_data, _config) -> tuple[bool, str]:  # noqa: C901
     rule_status: dict[str, RuleStatus] = {}
 
     def can_run_rule(rule_name):
@@ -49,13 +97,13 @@ def execute_rules(raw_file, map_data, config) -> tuple[bool, str]:
             return False
         return rule_status[rule_name]
 
-    for rule in config['rules']:
+    for rule in _config["rules"]:
         current_rule_status = RuleStatus(explain=None, status=Status.FAILED, violations=[])
         try:
             rule = BaseRuleConfig(**rule)
-        except ValidationError as e:
-            logging.error(e)
-            rule = BaseRuleConfig({'name': rule['name']})
+        except ValidationError as v:
+            logging.error(v)
+            # rule = BaseRuleConfig({"name": rule["name"]})
             continue
 
         rule_status[rule.name] = current_rule_status
@@ -71,8 +119,10 @@ def execute_rules(raw_file, map_data, config) -> tuple[bool, str]:
             current_rule_status.passed = Status.FAILED
             continue
 
-        rule_func: BaseRule|None = getattr(rule_module, rule.class_name, None)(raw_file, map_data, rule.params)
-        if not rule_func:
+        rule_func: BaseRule | None = getattr(rule_module, rule.class_name, None)(
+            raw_file, map_data, rule.params
+        )  # TODO: Fix unexpected errors at this point
+        if rule_func is None:
             logging.warning(f"⚠️ Rule function '{rule.name}' not found in module '{rule.module}'.")
             current_rule_status.passed = Status.WARN
             continue
@@ -82,96 +132,51 @@ def execute_rules(raw_file, map_data, config) -> tuple[bool, str]:
         rule_time_started = time.time()
         try:
             violations = rule_func.evaluate()
-            rule_time_finished = time.time()
-            rule_time_elapsed: float = rule_time_finished - rule_time_started
+            rule_time_elapsed: float = time.time() - rule_time_started
 
-            success = True
-            if len(violations) > 0:
-                success = False
+            if violations:
                 current_rule_status.violations = violations
                 for violation in violations:
                     logging.info(f"Violation: {violation}")
 
-            if success:
+                _result = __handle_rule_error(
+                    rule,
+                    rule_status,
+                    f"❌ Rule '{rule.name}' failed (REQUIRED). Exiting with error. ({rule_time_elapsed:.2f}s)",
+                    f"⚠️ Rule '{rule.name}' failed but continuing. ({rule_time_elapsed:.2f}s)",
+                    f"⏭️ Rule '{rule.name}' failed but skipping. ({rule_time_elapsed:.2f}s)",
+                )
+                if _result is not None:
+                    return _result
+            else:
                 logging.info(f"✅ Rule '{rule.name}' passed. ({rule_time_elapsed:.2f}s)")
                 current_rule_status.status = Status.COMPLETED
-            else:
-                if rule.type == "require":
-                    current_rule_status.status = Status.FAILED
-                    logging.error(f"❌ Rule '{rule.name}' failed (REQUIRED). Exiting with error. ({rule_time_elapsed:.2f}s)")
-                    status_symbol = {
-                        Status.COMPLETED: "✅",
-                        Status.FAILED: "❌",
-                        Status.WARN: "⚠️",
-                        Status.SKIP: "⏭️"
-                    }
-                    result_string = (
-                    f"\n#### { status_symbol.get(rule.status, '❌') } {rule.rule.name}\n"
-                    f"**Explanation**: { rule.explain if rule.status != Status.COMPLETED else '-' }\n"
-                    f"**Violations**: { "\n" if len(rule.violations) > 0 else "\n- No violations detected" }\n"
-                    f"{ "\n".join([f"- {r}" for r in rule.violations]) }"
-                    )
-                    return False, result_string
-                elif rule.type == "fail":
-                    current_rule_status.status = Status.WARN
-                    logging.info(f"⚠️ Rule '{rule.name}' failed but continuing. ({rule_time_elapsed:.2f}s)")
-                elif rule.type == "skip":
-                    current_rule_status.status = Status.SKIP
-                    logging.info(f"⏭️ Rule '{rule.name}' failed but skipping. ({rule_time_elapsed:.2f}s)")
 
         except Exception as e:
-            rule_time_finished = time.time()
-            rule_time_elapsed: float = rule_time_finished - rule_time_started
-            if rule.type == "require":
-                current_rule_status.status = Status.FAILED
-                logging.error(f"❌ Rule '{rule.name}' encountered an error (REQUIRED). ({rule_time_elapsed:.2f}s) Exiting: {e}")
-                status_symbol = {
-                    Status.COMPLETED: "✅",
-                    Status.FAILED: "❌",
-                    Status.WARN: "⚠️",
-                    Status.SKIP: "⏭️"
-                }
-                result_string = (
-                f"\n#### { status_symbol.get(rule.status, '❌') } {rule.rule.name}\n"
-                f"**Explanation**: { rule.explain if rule.status != Status.COMPLETED else '-' }\n"
-                f"**Violations**: { "\n" if len(rule.violations) > 0 else "\n- No violations detected" }\n"
-                f"{ "\n".join([f"- {r}" for r in rule.violations]) }"
-                )
-                return False, result_string
-            elif rule.type == "fail":
-                current_rule_status.status = Status.WARN
-                logging.error(f"⚠️ Rule '{rule.name}' encountered an error ({rule_time_elapsed:.2f}s): {traceback.print_exc()}")
-            elif rule.type == "skip":
-                current_rule_status.status = Status.SKIP
-                logging.error(f"⏭️ Rule '{rule.name}' encountered an error but skipping ({rule_time_elapsed:.2f}s): {e}")
+            rule_time_elapsed = time.time() - rule_time_started
+            _result = __handle_rule_error(
+                rule,
+                rule_status,
+                f"❌ Rule '{rule.name}' encountered an error (REQUIRED). ({rule_time_elapsed:.2f}s) Exiting: {e}",
+                f"⚠️ Rule '{rule.name}' encountered an error ({rule_time_elapsed:.2f}s): {traceback.print_exc()}",
+                f"⏭️ Rule '{rule.name}' encountered an error but skipping ({rule_time_elapsed:.2f}s): {e}",
+            )
+            if _result is not None:
+                return _result
 
-    result_string = ""
-    for passed in rule_status:
-        rule = rule_status[passed]
-        status_symbol = {
-            Status.COMPLETED: "✅",
-            Status.FAILED: "❌",
-            Status.WARN: "⚠️",
-            Status.SKIP: "⏭️"
-        }
-        result_string += (
-        f"\n#### { status_symbol.get(rule.status, '❌') } {rule.rule.name}\n"
-        f"**Explanation**: { rule.explain if rule.status != Status.COMPLETED else '-' }\n"
-        f"**Violations**: { "\n" if len(rule.violations) > 0 else "\n- No violations detected" }\n"
-        f"{ "\n".join([f"- {r}" for r in rule.violations]) }"
-        )
-
+    result_string = "".join(__format_rule_summary(rule_status[passed]) for passed in rule_status)
     logging.info("🎉 All rules processed successfully.")
     return True, result_string
 
+
 def generate_rules_file():
-    config = load_all_rules('map_rules/', exclude=[])
+    _config = load_all_rules("map_rules/", exclude=[])
     rule_evaluation = []
-    for rule in config['rules']:
+    for rule in _config["rules"]:
         try:
             rule = BaseRuleConfig(**rule)
-        except ValidationError as e:
-            logging.error(e)
+        except ValidationError as v:
+            logging.error(v)
             continue
 
         rule_module = load_rule_from_module(rule.module)
@@ -182,11 +187,18 @@ def generate_rules_file():
         if not rule_func:
             continue
 
-        rule_evaluation.append({ 'name': rule.name, 'desc': rule.description, 'explain': rule_func.explain(), 'required': True if rule.type == 'require' else False })
+        rule_evaluation.append(
+            {
+                "name": rule.name,
+                "desc": rule.description,
+                "explain": rule_func.explain(),
+                "required": rule.type == "require",
+            }
+        )
     return rule_evaluation
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--map", default=os.environ.get("INPUT_MAP"))
     parser.add_argument("--skip")
@@ -205,7 +217,7 @@ if __name__ == '__main__':
             if args.skip:
                 excluded = args.skip.split(",") if "," in args.skip else [args.skip]
 
-            config = load_all_rules('map_rules/', exclude=excluded)
+            config = load_all_rules("map_rules/", exclude=excluded)
             tw_map = twmap.Map(args.map)
             result = execute_rules(args.map, tw_map, config)
 
@@ -226,7 +238,7 @@ if __name__ == '__main__':
         else:
             output.append("❌ Invalid action defined!")
             exit_code = 1
-    except Exception as e:
+    except Exception as e:  # noqa: F841
         exit_code = 1
     finally:
         for line in output:
